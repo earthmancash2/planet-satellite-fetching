@@ -21,7 +21,7 @@ cloud_cover_filter = {
   "type": "RangeFilter",
   "field_name": "cloud_cover",
   "config": {
-    "lte": 0.0
+    "lte": 0.05
   }
 }
 
