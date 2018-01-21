@@ -3,7 +3,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from geopy import Point
 from geopy.distance import VincentyDistance, vincenty
-import ImageClip
+from ImageClip import ImageClip, image_clip_df_decoder
 from multiprocessing.dummy import Pool as ThreadPool
 from retrying import retry
 from time import gmtime, strftime, sleep
@@ -18,7 +18,7 @@ def get_clipped_image_boundaries(overall_bounding_box, width, height):
   """
   def get_east_boundary_boxes(origin_bounding_box):
     # get boundary box to the east by making new boundary box current's ne corner as origin
-    destination_bounding_box = ImageClip.ImageClip(
+    destination_bounding_box = ImageClip(
       origin_bounding_box.nw_lat(), 
       origin_bounding_box.se_lng(), 
       width=width, height=height
@@ -48,7 +48,7 @@ def get_clipped_image_boundaries(overall_bounding_box, width, height):
     # Get all boxes to the east before going one row down
     boxes_east = [origin_bounding_box] + get_east_boundary_boxes(origin_bounding_box)
 
-    box_south = ImageClip.ImageClip(
+    box_south = ImageClip(
       origin_bounding_box.se_lat(),
       origin_bounding_box.nw_lng(),
       width=width, height=height
@@ -66,7 +66,7 @@ def get_clipped_image_boundaries(overall_bounding_box, width, height):
   print("Getting smaller boundary boxes from {}".format(str(overall_bounding_box)))
 
   # Seed the recursion with the smaller bounding box in NW corner
-  origin_bounding_box = ImageClip.ImageClip(
+  origin_bounding_box = ImageClip(
     overall_bounding_box.nw_lat(), 
     overall_bounding_box.nw_lng(), 
     width=width, 
@@ -113,8 +113,11 @@ def get_clipped_image_info(overall_bounding_box, width, height, item_type, asset
 
       satellite_image_search_params = {
         "type": "AndFilter",
-        "config": [geometry_filter, date_range_filter, cloud_cover_filter, full_image_filter, 
-      permission_filter]
+        "config": [geometry_filter,
+          date_range_filter,
+          cloud_cover_filter,
+          permission_filter
+        ]
       }
 
       search_endpoint_request = {
@@ -122,6 +125,7 @@ def get_clipped_image_info(overall_bounding_box, width, height, item_type, asset
         "filter": satellite_image_search_params
       }
 
+      print("sending search request {}".format(str(search_endpoint_request)))
       result = s.post(
         'https://api.planet.com/data/v1/quick-search',
         auth=HTTPBasicAuth(os.environ['PL_API_KEY'], ''),
@@ -135,8 +139,8 @@ def get_clipped_image_info(overall_bounding_box, width, height, item_type, asset
       response = result.json()
       if(len(response['features'])):
         image_id = response['features'][0]['id']
-        bounding_box.set_image_id(image_id)
         print("Got image ID: {}".format(image_id))
+        bounding_box.set_image_info(image_id, item_type, asset_type)
       elif(result.status_code == 200):
         print("ERROR: successful request, but no image IDs returned. result is {}".format(str(response)))
 
@@ -147,7 +151,60 @@ def get_clipped_image_info(overall_bounding_box, width, height, item_type, asset
   
   return(clipped_image_boundaries)
 
-def download_clipped_images(clipped_images, item_type, asset_type):
+def write_clip_summary_file(filename, clipped_images):
+  """
+  Write a summary csv file of clips, including their coordinates
+  and planet image info
+  """
+  import csv
+  print("Writing clip summary file {}".format(filename))
+  with open(filename, 'w') as csvfile:
+    # get headers from first clip
+    summarywriter = csv.DictWriter(csvfile,clipped_images[0].to_dict().keys())
+    summarywriter.writeheader()
+    for clip in clipped_images:
+      summarywriter.writerow(clip.to_dict())
+  print("Summary file {} written!".format(filename))
+  return
+
+def load_clipped_image_info(filename):
+  """
+  Load a previously written summary csv file of clips.
+  It uses pandas to read the csv to understand
+  field types, eg. floats
+  """
+  import pandas as pd
+  print("Loading clip summary file {}".format(filename))
+  df = pd.read_csv(filename)
+  clips = [image_clip_df_decoder(c) for index, c in df.iterrows()]
+  return clips
+
+def write_boundary_hits_file(download_status_codes):
+  """
+  Having an issue downloading clips that are on the boundary
+  of satellite images. The search API is returning image IDs
+  for images that don't completely overlap the clip, which then
+  errors out when downloading.
+
+  For now, going to write each clip to which this happens to a
+  file for later downloading
+  """
+  import csv
+
+  boundary_hits_filename = os.path.join(os.environ['PL_IMAGE_DIR'], "boundary_hits.csv")
+  with open(boundary_hits_filename, 'w') as csvfile:
+    # get headers from first clip
+    headers = list(download_status_codes[0][0].to_dict().keys())
+    headers.insert(0, 'status_code')
+    boundary_hit_writer = csv.DictWriter(csvfile, headers)
+    boundary_hit_writer.writeheader()
+    for d in download_status_codes:
+      outdict = d[0].to_dict()
+      outdict['status_code'] = d[1]
+      boundary_hit_writer.writerow(outdict)
+  return
+
+def download_clipped_images(clipped_images):
   """
   Given a complete clip image info object, download the clip using the fetched image ID.
 
@@ -168,19 +225,27 @@ def download_clipped_images(clipped_images, item_type, asset_type):
       if not clip.image_id:
         raise ValueError("Can only download clip with valid image ID")
 
+      download_filename = os.environ['PL_IMAGE_DIR'] + "Clip " + clip.item_type + \
+            "-" + clip.asset_type + " " + clip.box_id + '.zip'
+
+      # If clip already downloaded, skip and return custom code 888
+      if os.path.isfile(download_filename):
+        print("clip {} already downloaded! Skipping...".format(download_filename))
+        return (clip, 888)
+
       # Prepare request to get clip download ready
       aoi = clip.prepare_geojson()
       targets = [
         {
           "item_id": clip.image_id, 
-          "item_type": item_type,
-          "asset_type": asset_type
+          "item_type": clip.item_type,
+          "asset_type": clip.asset_type
         }
       ]
       clip_query_json = {"aoi": aoi, "targets": targets}
 
-      print("Pinging Planet API for clip with item_id: {}".format(clip.image_id))
-  
+      print("Pinging Planet API for clip {} with item_id: {}".format(clip.box_id, clip.image_id))
+
       result = s.post(
         'https://api.planet.com/compute/ops/clips/v1',
         auth=HTTPBasicAuth(os.environ['PL_API_KEY'], ''),
@@ -188,6 +253,10 @@ def download_clipped_images(clipped_images, item_type, asset_type):
 
       if result.status_code == 429:
         raise Exception("rate limit error")
+      elif result.status_code == 400:
+        # Boundary of satellite image, skip and save for later
+        print("AOI out of bounds for clip {}".format(str(clip.box_id)))
+        return (clip, result.status_code)
 
       # Check status of clip image download
       download_id = result.json()['id']
@@ -199,43 +268,58 @@ def download_clipped_images(clipped_images, item_type, asset_type):
         sleep(1)
         timer_count += 1
         status_url = 'https://api.planet.com/compute/ops/clips/v1/' + download_id
-        print("Checking on download {}".format(status_url))
+
         download_result = s.get(
           url=status_url,
           auth=HTTPBasicAuth(os.environ['PL_API_KEY'], '')
           )
 
         download_result_json = download_result.json()
-        print("download state: {}".format(download_result_json['state']))
 
         if(download_result.json()['state'] == 'succeeded'):
           download_done = True
           download_url = download_result.json()['_links']['results'][0]
-          
-          download_filename = os.environ['PL_IMAGE_DIR'] + "Clip " + item_type + "-" + asset_type + " " + \
-            strftime("%Y-%m-%d %H:%M:%S", gmtime()) + " " + download_id + '.zip'
 
           print("Downloading file to {}".format(download_filename))
 
           r = s.get(download_url, allow_redirects=True)
           open(download_filename, 'wb').write(r.content)
 
+      return (clip, result.status_code)
         
     thread_pool = ThreadPool(5)
-    thread_pool.map(download_clip, clipped_images)
+    download_status_codes = thread_pool.map(download_clip, clipped_images)
+
+    # Write box_ids for images where planet API returned bad image IDs
+    write_boundary_hits_file(download_status_codes)
 
   return
 
 # Test run with coordinates in Marin. NOTE: Planet API only allows free fetching
 # for images in California
 
-nw_lng = -122.603771
-nw_lat = 37.973560
+nw_lng = -122.509337
+nw_lat = 37.807952
+se_lng = -122.378702
+se_lat = 37.713905
 
-item_type = 'PSScene4Band'
+#nw_lng = -122.46394153223865
+#nw_lat = 37.76290386679462
+
+item_type = 'PSScene3Band'
 asset_type = 'visual'
 
-test_bounding_box = ImageClip.ImageClip(nw_lat, nw_lng, width=500, height=500)
-image_clips = get_clipped_image_info(test_bounding_box, 200, 200, item_type, asset_type)
-download_clipped_images(image_clips, item_type, asset_type)
+# Determine bounding boxes and search for image IDs
+# test_bounding_box = ImageClip(nw_lat, nw_lng, width=300, height=300)
+#test_bounding_box = ImageClip(nw_lat, nw_lng, se_lat=se_lat, se_lng=se_lng)
+#image_clips = get_clipped_image_info(test_bounding_box, 200, 200, item_type, asset_type)
+
+# summary_filename = os.environ['PL_IMAGE_DIR'] + "Clips_Summary_" + \
+#   strftime("%Y-%m-%d", gmtime()) + ".csv"
+# write_clip_summary_file(summary_filename, image_clips)
+
+# Load previously searched bounding boxes.
+summary_filename = os.path.join(os.environ['PL_IMAGE_DIR'], "Clips_Summary_2018-01-09.csv")
+image_clips = load_clipped_image_info(summary_filename)
+download_clipped_images(image_clips)
 

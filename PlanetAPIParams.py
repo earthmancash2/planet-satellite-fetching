@@ -3,7 +3,6 @@ Set of filters for searches and download requests to planet API. This includes:
  - Time window for images
  - Tolerable level of cloud cover
  - Only full images or cropped images as well
- - Only images that I'm allowed to download or others as well
 """
 
 # filter images acquired in a certain date range
